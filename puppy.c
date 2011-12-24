@@ -8,6 +8,7 @@
 /*
 
   Copyright (C) 2004-2008 Peter Urbanec <toppy at urbanec.net>
+  Copyright (C) 2009 Mark Colclough <m.s.colclough bham.ac.uk> (findToppy)
 
   This file is part of puppy.
 
@@ -44,6 +45,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <asm/byteorder.h>
+#include <dirent.h>
 
 #include "usb_io.h"
 #include "tf_bytes.h"
@@ -51,7 +53,9 @@
 #define PUT 0
 #define GET 1
 
-#define MAX_DEVICES_LINE_SIZE 128
+#define SYSPATH_MAX 256
+#define TOPPYVID 0x11db
+#define TOPPYPID 0x1000
 
 extern time_t timezone;
 
@@ -961,8 +965,7 @@ void usage(char *myName)
         " -P             - full packet dump output to stderr\n"
         " -q             - quiet transfers - no progress updates\n"
         " -v             - verbose output to stderr\n"
-        " -d <device>    - USB device (must be usbfs)\n"
-        "                  for example /proc/bus/usb/001/003\n"
+        " -d <device>    - USB device, for example /dev/bus/usb/001/003\n"
         " -c <command>   - one of size, dir, get, put, rename, delete, mkdir, reboot, cancel, turbo\n"
         " args           - optional arguments, as required by each command\n\n"
         "Version: " PUPPY_RELEASE ", Compiled: " __DATE__ "\n";
@@ -1142,16 +1145,33 @@ int parseArgs(int argc, char *argv[])
 
 int isToppy(struct usb_device_descriptor *desc)
 {
-    return (desc->idVendor == 0x11db) && (desc->idProduct == 0x1000);
+    return (desc->idVendor == TOPPYVID) && (desc->idProduct == TOPPYPID);
 }
 
+/* Read up to valuesize bytes from the file /sys/bus/usb/devices/DEVNAME/ITEM
+ * into the string pointed at by value.  Return 1=OK, 0=error */
+int readsysfs(char* devname, char* item, char *value, int valuesize)
+{
+    char filname[SYSPATH_MAX];
+    FILE *fil;
+
+    snprintf(filname, SYSPATH_MAX, "/sys/bus/usb/devices/%s/%s", devname, item);
+    if (!(fil = fopen(filname, "r"))) return 0;
+    fgets(value, valuesize, fil);
+    fclose(fil);
+    return 1;
+}
+
+/* Find a Topfield PVR on the usb.  Return the device as a static string of the
+ * form /dev/bus/usb/BBB/DDD or NULL if not found or other error. */
 char *findToppy(void)
 {
-    FILE *toppy;
-    char buffer[MAX_DEVICES_LINE_SIZE];
-    int bus, device;
-    unsigned int vendor, prodid;
-    int found = 0;
+    DIR *devicesdir;
+    struct dirent *direntry;
+    char vid[5];
+    char pid[5];
+    char bus[5];
+    char device[5];
     static char pathBuffer[32];
 
     /* Refuse to scan while another instance is running. */
@@ -1162,58 +1182,53 @@ char *findToppy(void)
         return NULL;
     }
 
-    /* Open the /proc/bus/usb/devices file, and read it to find candidate Topfield devices. */
-    if((toppy = fopen("/proc/bus/usb/devices", "r")) == NULL)
+    pathBuffer[0] = '\0';  /* Signify nothing found at entry */
+
+    /* Iterate over all usb devices, looking for Topfield */
+    if (!(devicesdir = opendir("/sys/bus/usb/devices")))
     {
         fprintf(stderr,
                 "ERROR: Can not perform autodetection.\n"
-                "ERROR: /proc/bus/usb/devices can not be open for reading.\n"
+                "ERROR: /sys/bus/usb/devices can not be opened.\n"
                 "ERROR: %s\n", strerror(errno));
         return NULL;
     }
 
-    /* Scan the devices file, line by line, looking for Topfield devices. */
-    while(fgets(buffer, MAX_DEVICES_LINE_SIZE, toppy))
+    while ((direntry = readdir(devicesdir)))
     {
+        /* Skip non-device entries */
+        if (direntry->d_name[0] == '.'
+            || direntry->d_name[0] == 'u'
+            || strchr(direntry->d_name, ':')) continue;
 
-        /* Store the information from topology lines. */
-        if(sscanf
-           (buffer, "T: Bus=%d Lev=%*d Prnt=%*d Port=%*d Cnt=%*d Dev#=%d",
-            &bus, &device))
+        /* Skip if not correct vendor and product ID */
+        readsysfs(direntry->d_name, "idVendor", vid, sizeof(vid));
+        readsysfs(direntry->d_name, "idProduct", pid, sizeof(pid));
+        trace(2, fprintf(stderr, "Found USB device bus-port=%s, vid=%s, pid=%s\n",
+                                                direntry->d_name, vid, pid));
+        if (strtol(vid, NULL, 16) != TOPPYVID
+            || strtol(pid, NULL, 16) != TOPPYPID) continue;
+
+        trace(1, fprintf(stderr, "Recognised Topfield device at bus-port=%s\n",
+                                                direntry->d_name));
+
+        /* Error if multiple matching devices found */
+        if (pathBuffer[0])
         {
-            trace(2,
-                  fprintf(stderr, "Found USB device at bus=%d, device=%d\n",
-                          bus, device));
+            fprintf(stderr,
+                    "ERROR: Multiple Topfield devices recognised.\n"
+                    "ERROR: Please use the -d option to specify a device.\n");
+            return NULL;
         }
 
-        /* Look for Topfield vendor/product lines, and also check for multiple devices. */
-        else if(sscanf(buffer, "P: Vendor=%x ProdID=%x", &vendor, &prodid)
-                && (vendor == 0x11db) && (prodid == 0x1000))
-        {
-            trace(1,
-                  fprintf(stderr,
-                          "Recognised Topfield device at bus=%d, device=%d\n",
-                          bus, device));
+        /* Construct the device path for the first matching device */
+        readsysfs(direntry->d_name, "busnum", bus, sizeof(bus));
+        readsysfs(direntry->d_name, "devnum", device, sizeof(device));
+        sprintf(pathBuffer, "/dev/bus/usb/%03d/%03d", atoi(bus), atoi(device));
 
-            /* If we've already found one, then there are multiple devices present. */
-            if(found)
-            {
-                fprintf(stderr,
-                        "ERROR: Multiple Topfield devices recognised.\n"
-                        "ERROR: Please use the -d option to specify a device.\n");
-                fclose(toppy);
-                return NULL;
-            }
-
-            /* Construct the device path according to the topology found. */
-            sprintf(pathBuffer, "/proc/bus/usb/%03d/%03d", bus, device);
-            found = 1;
-        }
+        /* Continue iterating, to check for multiple matching devices */
     }
-
-    fclose(toppy);
-
-    if(found)
+    if (pathBuffer[0])
     {
         return pathBuffer;
     }
