@@ -1,0 +1,11 @@
+Source: puppy
+Section: misc
+Priority: optional
+Maintainer: Robie Basak <robie@justgohome.co.uk>
+Build-Depends: debhelper (>= 7)
+Standards-Version: 3.9.2
+
+Package: puppy
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: command line application to manage the Topfield TF5000PVRt PVR
